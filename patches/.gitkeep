@@ -1,0 +1,1 @@
+# 将自定义的 git diff 补丁命名为 *.patch 放在此目录下，GitHub Actions 构建时会自动 git apply。

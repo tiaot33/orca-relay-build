@@ -1,0 +1,25 @@
+[Unit]
+Description=Orca Self-Hosted Relay Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orca-relay
+Group=orca-relay
+WorkingDirectory=/opt/orca-relay/current
+EnvironmentFile=/etc/orca-relay/relay.env
+ExecStart=/usr/bin/node apps/relay/dist/index.js
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+# 基础安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/orca-relay
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,282 @@
+name: Build Orca Relay Bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "指定上游 Tag/分支（留空则自动取 stablyai/orca 最新正式 Release）"
+        required: false
+        default: ""
+        type: string
+      force_rebuild:
+        description: "即使 cloud/ 目录无变化也强制重新打包"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # 每周三北京时间 03:37（UTC 周二 19:37）错峰定检 1 次，平时零消耗
+    - cron: "37 19 * * 2"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-orca-relay
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Check & Build Relay
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Preflight check upstream release & cloud/ tree hash (zero clone)
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.upstream_ref }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_REF}" ]; then
+            UPSTREAM_REF="${INPUT_REF}"
+          else
+            UPSTREAM_REF="$(gh api repos/stablyai/orca/releases/latest --jq '.tag_name')"
+          fi
+
+          if [ -z "${UPSTREAM_REF}" ] || [ "${UPSTREAM_REF}" = "null" ]; then
+            echo "Failed to resolve upstream ref" >&2
+            exit 1
+          fi
+
+          UPSTREAM_COMMIT="$(gh api "repos/stablyai/orca/commits/${UPSTREAM_REF}" --jq '.sha')"
+          CLOUD_TREE_SHA="$(gh api "repos/stablyai/orca/git/trees/${UPSTREAM_COMMIT}" --jq '.tree[] | select(.path=="cloud") | .sha')"
+
+          if [ -z "${CLOUD_TREE_SHA}" ] || [ "${CLOUD_TREE_SHA}" = "null" ]; then
+            echo "Could not find cloud/ directory in stablyai/orca@${UPSTREAM_REF}" >&2
+            exit 1
+          fi
+
+          # Sanitize release tag name when building from a branch name like main
+          SAFE_REF="$(printf '%s' "${UPSTREAM_REF}" | tr '/' '-')"
+          if [[ "${SAFE_REF}" == v* ]]; then
+            RELEASE_TAG="${SAFE_REF}"
+          else
+            RELEASE_TAG="${SAFE_REF}-${UPSTREAM_COMMIT:0:7}"
+          fi
+
+          echo "Upstream ref:    ${UPSTREAM_REF}"
+          echo "Upstream commit: ${UPSTREAM_COMMIT}"
+          echo "cloud/ tree SHA: ${CLOUD_TREE_SHA}"
+          echo "Target tag:      ${RELEASE_TAG}"
+
+          SHOULD_BUILD="true"
+          if [ "${FORCE_REBUILD}" != "true" ]; then
+            # 1) Exact tag already published?
+            if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+              echo "Release ${RELEASE_TAG} already exists. Skipping."
+              SHOULD_BUILD="false"
+            # 2) Auto mode: did cloud/ actually change compared to our latest release?
+            elif [ -z "${INPUT_REF}" ]; then
+              LAST_BODY="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.body' 2>/dev/null || true)"
+              if printf '%s\n' "${LAST_BODY}" | grep -Fq "cloud_tree_sha: ${CLOUD_TREE_SHA}"; then
+                echo "cloud/ tree (${CLOUD_TREE_SHA}) is unchanged since latest release. Skipping build."
+                SHOULD_BUILD="false"
+              fi
+            fi
+          fi
+
+          {
+            echo "should_build=${SHOULD_BUILD}"
+            echo "upstream_ref=${UPSTREAM_REF}"
+            echo "upstream_commit=${UPSTREAM_COMMIT}"
+            echo "cloud_tree_sha=${CLOUD_TREE_SHA}"
+            echo "release_tag=${RELEASE_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout build repository (for optional patches)
+        if: steps.check.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Sparse-checkout stablyai/orca cloud/ only
+        if: steps.check.outputs.should_build == 'true'
+        env:
+          UPSTREAM_COMMIT: ${{ steps.check.outputs.upstream_commit }}
+        run: |
+          set -euo pipefail
+          git init upstream
+          cd upstream
+          git remote add origin https://github.com/stablyai/orca.git
+          git sparse-checkout init --cone
+          git sparse-checkout set cloud
+          git fetch --depth 1 --filter=blob:none origin "${UPSTREAM_COMMIT}"
+          git checkout --detach FETCH_HEAD
+
+          # Apply optional user patches if any exist in patches/*.patch
+          if compgen -G "${GITHUB_WORKSPACE}/self/patches/*.patch" > /dev/null; then
+            for patch_file in "${GITHUB_WORKSPACE}/self/patches/"*.patch; do
+              echo "Applying patch: ${patch_file}"
+              git apply "${patch_file}"
+            done
+          fi
+
+      - name: Setup Node.js 24
+        if: steps.check.outputs.should_build == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Build & Assemble Pure-JS Relay Bundle
+        if: steps.check.outputs.should_build == 'true'
+        env:
+          UPSTREAM_REF: ${{ steps.check.outputs.upstream_ref }}
+          UPSTREAM_COMMIT: ${{ steps.check.outputs.upstream_commit }}
+          CLOUD_TREE_SHA: ${{ steps.check.outputs.cloud_tree_sha }}
+          RELEASE_TAG: ${{ steps.check.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          CLOUD_SRC="${GITHUB_WORKSPACE}/upstream/cloud"
+          WORK_DIR="${RUNNER_TEMP}/relay-pack"
+          mkdir -p \
+            "${WORK_DIR}/build/packages" \
+            "${WORK_DIR}/build/apps" \
+            "${WORK_DIR}/runtime/packages/relay-contract" \
+            "${WORK_DIR}/runtime/packages/postgres-schema" \
+            "${WORK_DIR}/runtime/apps/relay" \
+            "${GITHUB_WORKSPACE}/dist-artifacts"
+
+          # Bootstrap exact pinned pnpm version from cloud/package.json
+          PNPM_SPEC="$(node -p 'require(process.argv[1]).packageManager.split("+")[0]' "${CLOUD_SRC}/package.json")"
+          npm install --prefix "${RUNNER_TEMP}/pnpm-bin" --ignore-scripts --no-audit --no-fund "${PNPM_SPEC}"
+          export PATH="${RUNNER_TEMP}/pnpm-bin/node_modules/.bin:${PATH}"
+          pnpm --version
+
+          # Stage 1: Minimal build workspace (avoids downloading wrangler/workerd/push deps)
+          cp "${CLOUD_SRC}/package.json" "${CLOUD_SRC}/pnpm-lock.yaml" "${CLOUD_SRC}/pnpm-workspace.yaml" "${CLOUD_SRC}/tsconfig.base.json" "${WORK_DIR}/build/"
+          cp -R "${CLOUD_SRC}/patches" "${WORK_DIR}/build/patches"
+          cp -R "${CLOUD_SRC}/packages/relay-contract" "${WORK_DIR}/build/packages/relay-contract"
+          cp -R "${CLOUD_SRC}/packages/postgres-schema" "${WORK_DIR}/build/packages/postgres-schema"
+          cp -R "${CLOUD_SRC}/apps/relay" "${WORK_DIR}/build/apps/relay"
+
+          (
+            cd "${WORK_DIR}/build"
+            pnpm install --frozen-lockfile
+            pnpm --filter @orca-cloud/postgres-schema build
+            pnpm --filter @orca-cloud/relay-contract build
+            pnpm --filter @orca-cloud/relay build
+          )
+
+          # Stage 2: Production-only runtime bundle
+          cp "${CLOUD_SRC}/package.json" "${CLOUD_SRC}/pnpm-lock.yaml" "${CLOUD_SRC}/pnpm-workspace.yaml" "${WORK_DIR}/runtime/"
+          cp -R "${CLOUD_SRC}/patches" "${WORK_DIR}/runtime/patches"
+          cp "${CLOUD_SRC}/packages/relay-contract/package.json" "${WORK_DIR}/runtime/packages/relay-contract/"
+          cp -R "${WORK_DIR}/build/packages/relay-contract/dist" "${WORK_DIR}/runtime/packages/relay-contract/dist"
+          cp "${CLOUD_SRC}/packages/postgres-schema/package.json" "${WORK_DIR}/runtime/packages/postgres-schema/"
+          cp -R "${WORK_DIR}/build/packages/postgres-schema/dist" "${WORK_DIR}/runtime/packages/postgres-schema/dist"
+          cp "${CLOUD_SRC}/apps/relay/package.json" "${WORK_DIR}/runtime/apps/relay/"
+          cp -R "${WORK_DIR}/build/apps/relay/dist" "${WORK_DIR}/runtime/apps/relay/dist"
+
+          (
+            cd "${WORK_DIR}/runtime"
+            pnpm install --prod --frozen-lockfile --filter @orca-cloud/relay...
+            rm -rf patches pnpm-lock.yaml pnpm-workspace.yaml
+          )
+
+          BUILT_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          cat > "${WORK_DIR}/runtime/BUILD_INFO.json" <<EOF
+          {
+            "releaseTag": "${RELEASE_TAG}",
+            "upstreamRef": "${UPSTREAM_REF}",
+            "upstreamCommit": "${UPSTREAM_COMMIT}",
+            "cloudTreeSha": "${CLOUD_TREE_SHA}",
+            "builtAt": "${BUILT_AT}"
+          }
+          EOF
+
+          # Ensure all symlinks are relative so archive is freely relocatable
+          if find "${WORK_DIR}/runtime" -type l -exec readlink {} + | grep -q '^/'; then
+            echo "Error: found absolute symlink in runtime bundle" >&2
+            exit 1
+          fi
+
+          ARTIFACT="${GITHUB_WORKSPACE}/dist-artifacts/orca-relay-bundle.tar.gz"
+          tar -czf "${ARTIFACT}" -C "${WORK_DIR}/runtime" .
+          (
+            cd "${GITHUB_WORKSPACE}/dist-artifacts"
+            sha256sum orca-relay-bundle.tar.gz > orca-relay-bundle.tar.gz.sha256
+          )
+          ls -lh "${GITHUB_WORKSPACE}/dist-artifacts/"
+
+      - name: Smoke Test Extracted Bundle (/health)
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          SMOKE_DIR="${RUNNER_TEMP}/smoke-test"
+          mkdir -p "${SMOKE_DIR}"
+          tar -xzf "${GITHUB_WORKSPACE}/dist-artifacts/orca-relay-bundle.tar.gz" -C "${SMOKE_DIR}"
+          cd "${SMOKE_DIR}"
+
+          node --input-type=module -e 'await import("./apps/relay/dist/app.js")'
+
+          PORT=18981 \
+          ORCA_RELAY_PUBLIC_URL=http://127.0.0.1:18981 \
+          ORCA_RELAY_CELL_URL=http://127.0.0.1:18981 \
+          ORCA_RELAY_AUTH_ISSUER=http://127.0.0.1:18981 \
+          ORCA_RELAY_JWKS_URL=http://127.0.0.1:18981/.well-known/jwks.json \
+          ORCA_RELAY_ASSIGNMENT_SIGNING_KEY=0123456789abcdef0123456789abcdef \
+          ORCA_RELAY_ADMIN_AUDIENCE=http://127.0.0.1:18981/v1/admin \
+          ORCA_RELAY_DEPLOY_SERVICE_ACCOUNT=admin@relay.local \
+          ORCA_RELAY_DATA_DIR="${SMOKE_DIR}/data" \
+          node apps/relay/dist/index.js &
+          SERVER_PID=$!
+          trap 'kill "${SERVER_PID}" 2>/dev/null || true' EXIT
+
+          PASSED=0
+          for _ in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:18981/health | grep -Fq '"ok":true'; then
+              PASSED=1
+              break
+            fi
+            sleep 0.3
+          done
+
+          kill "${SERVER_PID}" 2>/dev/null || true
+          wait "${SERVER_PID}" 2>/dev/null || true
+          test "${PASSED}" -eq 1
+
+      - name: Publish GitHub Release
+        if: steps.check.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.check.outputs.release_tag }}
+          UPSTREAM_REF: ${{ steps.check.outputs.upstream_ref }}
+          UPSTREAM_COMMIT: ${{ steps.check.outputs.upstream_commit }}
+          CLOUD_TREE_SHA: ${{ steps.check.outputs.cloud_tree_sha }}
+        run: |
+          set -euo pipefail
+          NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
+          cat > "${NOTES_FILE}" <<EOF
+          Prebuilt pure-JS runtime bundle for `@orca-cloud/relay` (Node.js 24+, SQLite/PostgreSQL).
+
+          - upstream_repo: https://github.com/stablyai/orca
+          - upstream_ref: ${UPSTREAM_REF}
+          - upstream_commit: ${UPSTREAM_COMMIT}
+          - cloud_tree_sha: ${CLOUD_TREE_SHA}
+          EOF
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" \
+              "${GITHUB_WORKSPACE}/dist-artifacts/orca-relay-bundle.tar.gz" \
+              "${GITHUB_WORKSPACE}/dist-artifacts/orca-relay-bundle.tar.gz.sha256" \
+              --clobber
+            gh release edit "${RELEASE_TAG}" --notes-file "${NOTES_FILE}"
+          else
+            gh release create "${RELEASE_TAG}" \
+              "${GITHUB_WORKSPACE}/dist-artifacts/orca-relay-bundle.tar.gz" \
+              "${GITHUB_WORKSPACE}/dist-artifacts/orca-relay-bundle.tar.gz.sha256" \
+              --title "Orca Relay ${RELEASE_TAG}" \
+              --notes-file "${NOTES_FILE}"
+          fi

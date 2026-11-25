@@ -1,0 +1,20 @@
+# 替换为你自己的域名（若家宽无 443 端口可写 relay.yourdomain.com:8443 并配置 DNS-01 证书）
+relay.yourdomain.com {
+    # 屏蔽内部管理路由
+    @admin path /v1/admin/*
+    respond @admin 403
+
+    # 替换为运行 Relay 的 PVE LXC 内网 IP
+    reverse_proxy 192.168.1.100:8080 {
+        # 对齐 Relay 源码 admissionSource() 读取倒数第二跳 IP 的逻辑
+        header_up X-Forwarded-For "{client_ip}, {upstream_hostport}"
+
+        health_uri /health
+        health_interval 30s
+
+        transport http {
+            read_timeout 360s
+            write_timeout 360s
+        }
+    }
+}

@@ -258,23 +258,23 @@ jobs:
         run: |
           set -euo pipefail
           NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
-          cat > "${NOTES_FILE}" <<EOF
-          Prebuilt pure-JS runtime bundle for `@orca-cloud/relay` (Node.js 24+, SQLite/PostgreSQL).
+          printf '%s\n' \
+            "Prebuilt pure-JS runtime bundle for @orca-cloud/relay (Node.js 24+, SQLite/PostgreSQL)." \
+            "" \
+            "- upstream_repo: https://github.com/stablyai/orca" \
+            "- upstream_ref: ${UPSTREAM_REF}" \
+            "- upstream_commit: ${UPSTREAM_COMMIT}" \
+            "- cloud_tree_sha: ${CLOUD_TREE_SHA}" \
+            > "${NOTES_FILE}"
 
-          - upstream_repo: https://github.com/stablyai/orca
-          - upstream_ref: ${UPSTREAM_REF}
-          - upstream_commit: ${UPSTREAM_COMMIT}
-          - cloud_tree_sha: ${CLOUD_TREE_SHA}
-          EOF
-
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" \
+          if gh release view "${RELEASE_TAG}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" -R "${GITHUB_REPOSITORY}" \
               "${GITHUB_WORKSPACE}/dist-artifacts/orca-relay-bundle.tar.gz" \
               "${GITHUB_WORKSPACE}/dist-artifacts/orca-relay-bundle.tar.gz.sha256" \
               --clobber
-            gh release edit "${RELEASE_TAG}" --notes-file "${NOTES_FILE}"
+            gh release edit "${RELEASE_TAG}" -R "${GITHUB_REPOSITORY}" --notes-file "${NOTES_FILE}"
           else
-            gh release create "${RELEASE_TAG}" \
+            gh release create "${RELEASE_TAG}" -R "${GITHUB_REPOSITORY}" --target main \
               "${GITHUB_WORKSPACE}/dist-artifacts/orca-relay-bundle.tar.gz" \
               "${GITHUB_WORKSPACE}/dist-artifacts/orca-relay-bundle.tar.gz.sha256" \
               --title "Orca Relay ${RELEASE_TAG}" \
